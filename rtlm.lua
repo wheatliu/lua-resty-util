@@ -84,12 +84,10 @@ local function pushlogs()
             text = file:read("*all")
             if #text > 0 then
                 local bytes, err = wb:send_text(text)
-            else
-                ngx.log(ngx.INFO, "no data append")
             end
         elseif nread < -1 then
             ngx.log(ngx.ERR, "get event failed")
-            break
+            return ngx.exit(500)
         end
     end
 end
