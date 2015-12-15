@@ -8,6 +8,7 @@ end
 local wsserver = require "resty.websocket.server"
 local ffi  = require "ffi"
 local cjson = require "cjson"
+local heartbeatFailureCount = 0
 
 ffi.cdef[[
         typedef signed char     int8_t;
@@ -33,7 +34,6 @@ ffi.cdef[[
         int inotify_init1(int flags);
         int inotify_add_watch(int fd, const char *pathname, uint32_t mask);
         int inotify_rm_watch(int fd, int wd);
-        int close(int fd);
 ]]
 
 local wb, err = wsserver.new{
@@ -59,7 +59,9 @@ end
 local IN_MODIFY = 0x00000002
 local chunk_size = 4096
 local buffer = ffi.new('char[?]', chunk_size)
-local filename = "/srv/logcollection/"..logfile..".log"
+local logpath = "/you/path"
+local postfix = ".log"
+local filename = logpath..logfile..postfix
 local cfilename = ffi.new("char["..#filename+1 .."]", filename)
 local file = io.open(filename, "r")
 local fd = ffi.C.inotify_init1(O_NONBLOCK)
@@ -70,29 +72,12 @@ if not file and (fd ~= -1) and (wd ~= -1) then
 end
 local offset = file:seek("end")
 
-local function jobs_clean()
-    ftype = io.type(file)
-    if ftype == "file" then
-    	file:close()
-    end
-    ffi.C.inotify_rm_watch(fd, wd)
-    ffi.C.close(fd)
-    ngx.log(ngx.ERR, "Close log file and rm wactch instanse ")
-end
-
-local ok, err = ngx.on_abort(jobs_clean)
-if not ok then
-     ngx.log(ngx.ERR, "failed to register the on_abort callback: ", err)
-     ngx.exit(500)
-end
-
-
-local function send_logs()
+local function pushlogs()
     while true do
     --  when event occur for monitored file, get the offset and filesize of monitored file
     --  then to calculate that how many bytes have been appended to monitored file and read it
     --  send to websocket client
-        ngx.sleep(0.01)
+        ngx.sleep(0.5)
         local nread = ffi.C.read(fd, buffer,chunk_size);
         nread = tonumber(nread)
         if nread >0 then
@@ -109,20 +94,57 @@ local function send_logs()
     end
 end
 
+local function heartbeat()
+    while true do
+        local bytes, err = wb:send_ping()
+        if not bytes then
+            ngx.log(ngx.ERR, "failed to send frame: ", err)
+        end
+        ngx.sleep(30)
+    end
+end
 
-local tsend = ngx.thread.spawn(send_logs)
+local t_heartbeat = ngx.thread.spawn(heartbeat)
+local t_push = ngx.thread.spawn(pushlogs)
+
+local function cleanjobs()
+    ftype = io.type(file)
+    if ftype == "file" then
+    	file:close()
+    end
+    ffi.C.inotify_rm_watch(fd, wd)
+    ffi.C.close(fd)
+    local ok, err = ngx.thread.kill(t_push)
+    if err then
+        ngx.log(ngx.ERR, "kill tsend thead failed")
+    end
+    local ok, err = ngx.thread.kill(t_heartbeat)
+    if err then
+        ngx.log(ngx.ERR, "kill send_ping thead failed")
+    end
+    ngx.log(ngx.ERR, "Close log file and rm wactch instanse ")
+end
+
+local ok, err = ngx.on_abort(cleanjobs)
+if not ok then
+     ngx.log(ngx.ERR, "failed to register the on_abort callback: ", err)
+     ngx.exit(500)
+end
 
 while true do
+    if heartbeatFailureCount >=3 then
+         cleanjobs()
+        return ngx.exit(415)
+    end
     local data, typ, err = wb:recv_frame()
     if wb.fata then
         ngx.log(ngx.ERR, "fatal error already happened")
-        jobs_clean()
+        cleanjobs()
         return ngx.exit(444)
     end
 
     if typ == "close" then
-        -- send a close frame back:
-        -- jobs_clean()
+        cleanjobs()
         local bytes, err = wb:send_close(1000, "enough, enough!")
         if not bytes then
             ngx.log(ngx.ERR, "failed to send the close frame: ", err)
@@ -135,17 +157,12 @@ while true do
 
 
     if err and string.find(err, ": timeout", 1, true) then
-        ngx.log(ngx.ERR, "Read timeout, send ping frame")
-        local bytes, err = wb:send_ping()
-        if not bytes then
-            ngx.log(ngx.ERR, "failed to send frame: ", err)
-        end
+        ngx.log(ngx.ERR, "Read timeout, time: ", heartbeatFailureCount)
+        heartbeatFailureCount = heartbeatFailureCount + 1
     elseif typ == "ping" then
-        -- send a pong frame back:
         local bytes, err = wb:send_pong(data)
-	ngx.log(ngx.ERR, "recived a pong frame")
         if not bytes then
-            ngx.log(ngx.ERR, "failed to send frame: ", err)
+            ngx.log(ngx.ERR, "failed to send pong frame: ", err)
         end
     end
 end
